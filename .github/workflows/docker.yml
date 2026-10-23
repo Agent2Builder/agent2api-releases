@@ -1,0 +1,194 @@
+name: docker
+
+# 构建网关镜像（amd64 + arm64）并推送到镜像仓库。
+#
+# ── 触发方式（2026-10 改：构建搬到独立账号）──────────────────
+#   本文件运行在 **Agent2Builder/agent2api-releases**（专用构建仓库）上，
+#   由主仓库推 `v*` tag 时派发过来的 `repository_dispatch` 触发。
+#
+#   · repository_dispatch（type=release）：产出 <版本号> 与 :latest
+#     预发布 tag（如 v3.1.0-beta.1）：只产出 <版本号>，**不移动 :latest**
+#   · 手动 workflow_dispatch：产出 :dev（移动测试 tag，不碰正式 tag）
+#
+#   为什么搬：镜像要编 amd64 + arm64 两个架构，是实打实的重负载；留在主仓库
+#   做 tag 触发最坏会被判定为 Actions 滥用。与 build.yml 同一取向。
+#
+# ── 推到哪里：两个仓库各自独立 ────────────────────────────────
+#   · **GHCR（恒推，无需任何 secret）**：`ghcr.io/${GHCR_OWNER}/${GHCR_REPO}`
+#     —— 见下面的 env。**不能**用 `${GITHUB_REPOSITORY}`：本工作流跑在构建
+#     仓库里，那个变量会解析成 `agent2builder/agent2api-releases`，镜像就推到
+#     构建账号的命名空间下去了，而用户拉的是 `aimod-cc/Agent2API`。
+#     ⚠️ GHCR 的**新包默认私有**：首次推送后要到包的设置里手动改成 Public，
+#     否则别人 docker pull 会 401（这一步只能人工点，API 改不了默认值）。
+#   · **Docker Hub（配了凭据才推）**：<DOCKERHUB_USERNAME>/agent2api。
+#     镜像名**跟着凭据的用户名走**，不在文件里写死。两个 secret 都没配时，
+#     这一步整体跳过，工作流照常绿（只推 GHCR）。
+#
+#   ⚠️ 两个 registry 的凭据都在**构建仓库**的 secrets 里，主仓库不再需要。
+
+#
+# ── 为什么 runner 上不用装 QEMU ───────────────────────────────
+# Dockerfile 的 builder 固定跑在 $BUILDPLATFORM：runner 是 amd64，arm64
+# 走 aarch64 工具链交叉编译。本地与 CI 同一套交叉编译路径，无需
+# setup-qemu-action，也没有 QEMU 模拟下 Rust 编译慢几十倍的问题。
+#
+# ── 缓存 ─────────────────────────────────────────────────────
+# type=gha 把 BuildKit 缓存挂到 Actions cache：Dockerfile 的「桩依赖层」
+# 首次编完整棵依赖树后落缓存，之后每次构建直接命中，只剩源码层重编。
+# 两个 registry 在**同一次构建**里推送（不是构建两遍）：镜像目标是一份
+# 清单，build-push 一次构建、给每个目标打同一套 tag。
+#
+# ── action 版本 ──────────────────────────────────────────────
+# 与 build.yml 同一标准：直接钉最新大版本。截至本次编写：
+# setup-buildx v4 / login v4 / metadata v6 / build-push v7，
+# login v4 起已默认 Node 24 运行时，无 Node 20 弃用问题。
+#
+# ── secrets ──────────────────────────────────────────────────
+#   DOCKERHUB_USERNAME / DOCKERHUB_TOKEN（Read & Write 权限的 Access Token）
+#   两者都配齐才推 Docker Hub；GHCR 不需要任何 secret。
+
+on:
+  repository_dispatch:
+    types: [release]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: '主仓库的 git ref（tag 或分支）'
+        required: false
+        type: string
+
+env:
+  # 镜像归属：用户拉的那个仓库，不是运行本工作流的构建仓库。
+  # 换主仓库时改这两行（GHCR 的包命名空间跟着 owner 走）。
+  GHCR_OWNER: aimod-cc
+  GHCR_REPO: Agent2API
+  # 源码：构建仓库里没有代码，要跨仓库 checkout 主仓库
+  SOURCE_REPO: aimod-cc/Agent2API
+  REF: ${{ github.event.client_payload.ref || github.event.inputs.ref }}
+
+permissions:
+  contents: read
+  # 推 GHCR 需要（GITHUB_TOKEN 往包命名空间写）
+  packages: write
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    # 两个 Docker Hub 凭据放在 **job 级 env**：`steps.if` 读不到 secrets 上下文
+    # （GitHub 的 context 可用性表里没有它），但读得到 env —— 于是「配没配」
+    # 只判定一次，组装镜像目标与登录两步共用同一份值。没配就是空串。
+    env:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.REF }}
+
+      - name: 设置 buildx
+        uses: docker/setup-buildx-action@v4
+
+      # 镜像目标是一份**新行分隔**的清单：GHCR 恒在，Docker Hub 看凭据。
+      # 组装成 step output 再交给 metadata-action（它的 images 本来就是这个形状），
+      # 于是 tag 规则（semver / latest / dev）只写一份、两个 registry 共用。
+      #
+      # GHCR 的名字用 env 里的 owner/repo 拼，**不用 GITHUB_REPOSITORY** ——
+      # 本工作流跑在构建仓库，那个变量是构建仓库的名字（见文件头）。
+      - name: 组装镜像目标
+        id: images
+        run: |
+          images=("ghcr.io/${GHCR_OWNER}/${GHCR_REPO}")
+          if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ]; then
+            images+=("${DOCKERHUB_USERNAME}/agent2api")
+          fi
+          {
+            echo "list<<IMAGES"
+            printf '%s\n' "${images[@]}"
+            echo "IMAGES"
+          } >> "$GITHUB_OUTPUT"
+          echo "本次镜像目标："
+          printf '  %s\n' "${images[@]}"
+
+      - name: 登录 GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      # 没配 Docker Hub 凭据时整步跳过（工作流不会因此变红）
+      - name: 登录 Docker Hub
+        if: env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != ''
+        uses: docker/login-action@v4
+        with:
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ env.DOCKERHUB_TOKEN }}
+
+      # 版本号与是否预发布**从 payload 的 ref 算**，不看 `github.ref`。
+      #
+      # 本工作流跑在构建仓库的 main 上，`github.ref` 恒为 `refs/heads/main`
+      # —— 用它的 `startsWith(github.ref, 'refs/tags/v')` 判断会永远为假，
+      # 于是只出 dev tag、正式镜像一个都不推（静默，工作流还照常绿）。
+      # 真正要发的是主仓库那个 tag，它在 `github.event.client_payload.ref` 里。
+      - name: 解析版本
+        id: version
+        env:
+          REF: ${{ env.REF }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          # 手动触发且没填 ref：出一份 :dev 测试镜像，不碰任何正式 tag。
+          # 这与原行为一致（原 workflow_dispatch 就是只出 dev）。
+          if [ -z "$REF" ]; then
+            if [ "$EVENT" = "workflow_dispatch" ]; then
+              echo "version=dev" >> "$GITHUB_OUTPUT"
+              echo "prerelease=true" >> "$GITHUB_OUTPUT"
+              echo "dev=true" >> "$GITHUB_OUTPUT"
+              echo "手动触发且未指定 ref：只出 :dev 测试镜像"
+              exit 0
+            fi
+            echo "::error::repository_dispatch 缺 client_payload.ref"
+            exit 1
+          fi
+          case "$REF" in
+            v*) VERSION="${REF#v}" ;;
+            *)
+              echo "::error::ref 不是 v* tag 形式：$REF"
+              exit 1
+              ;;
+          esac
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "dev=false" >> "$GITHUB_OUTPUT"
+          case "$VERSION" in
+            *-*) PRERELEASE=true ;;
+            *)   PRERELEASE=false ;;
+          esac
+          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
+          echo "镜像版本 $VERSION（预发布=$PRERELEASE）"
+
+      # 正式版：<版本> + latest；beta：只出 <版本>（不移动 latest）
+      #
+      # latest **只跟正式版走**：beta tag（v3.1.0-beta.1）带 `-`，不移动 latest ——
+      # 应用里的「加入 beta 版」是一次显式选择，而 `docker pull :latest` 的人没做
+      # 这个选择；推一次 beta 就把 :latest 换掉等于绕过那道开关。beta 镜像照旧
+      # 会出 3.1.0-beta.1 这个版本 tag，想尝鲜的按版本号拉即可。
+      - name: 生成镜像 tag
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.images.outputs.list }}
+          tags: |
+            type=raw,value=${{ steps.version.outputs.version }}
+            type=raw,value=latest,enable=${{ steps.version.outputs.prerelease == 'false' }}
+
+      - name: 构建并推送
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
