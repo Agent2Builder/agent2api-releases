@@ -13,18 +13,22 @@ name: docker
 #   为什么搬：镜像要编 amd64 + arm64 两个架构，是实打实的重负载；留在主仓库
 #   做 tag 触发最坏会被判定为 Actions 滥用。与 build.yml 同一取向。
 #
-# ── 推到哪里：两个仓库各自独立 ────────────────────────────────
-#   · **GHCR（恒推，无需任何 secret）**：`ghcr.io/${GHCR_OWNER}/${GHCR_REPO}`
-#     —— 见下面的 env。**不能**用 `${GITHUB_REPOSITORY}`：本工作流跑在构建
-#     仓库里，那个变量会解析成 `agent2builder/agent2api-releases`，镜像就推到
-#     构建账号的命名空间下去了，而用户拉的是 `aimod-cc/Agent2API`。
-#     ⚠️ GHCR 的**新包默认私有**：首次推送后要到包的设置里手动改成 Public，
-#     否则别人 docker pull 会 401（这一步只能人工点，API 改不了默认值）。
-#   · **Docker Hub（配了凭据才推）**：<DOCKERHUB_USERNAME>/agent2api。
-#     镜像名**跟着凭据的用户名走**，不在文件里写死。两个 secret 都没配时，
-#     这一步整体跳过，工作流照常绿（只推 GHCR）。
+# ── 推到哪里：只推 Docker Hub ──────────────────────────────────
+#   `<DOCKERHUB_USERNAME>/agent2api`，镜像名跟着凭据的用户名走（当前是
+#   `aimodcc/agent2api`），不在文件里写死。
 #
-#   ⚠️ 两个 registry 的凭据都在**构建仓库**的 secrets 里，主仓库不再需要。
+#   ── 为什么不用 GHCR ────────────────────────────────────────
+#   本工作流跑在构建仓库（`Agent2Builder/...`）下，用的 `GITHUB_TOKEN` 属于
+#   那个仓库。GHCR 的包命名空间跟**账号**走：要推 `ghcr.io/aimod-cc/...`
+#   就得让 `Agent2Builder` 的 token 有写 `aimod-cc` 命名空间的权限 —— 那是
+#   跨账号授权，GitHub 不认（实测 `denied: permission_denied: The requested
+#   installation does not exist`）。推到自己名下（`ghcr.io/agent2builder/...`）
+#   倒是能成，但那样镜像地址就跟用户文档、`docker-compose.yml` 全对不上。
+#
+#   与其为一条备用渠道多维护一个 PAT 与包权限，不如只保留 Docker Hub：
+#   它本来就是用户实际在用的那一个。
+#
+#   ⚠️ Docker Hub 的两个凭据在**构建仓库**的 secrets 里，主仓库不再需要。
 
 #
 # ── 为什么 runner 上不用装 QEMU ───────────────────────────────
@@ -45,7 +49,7 @@ name: docker
 #
 # ── secrets ──────────────────────────────────────────────────
 #   DOCKERHUB_USERNAME / DOCKERHUB_TOKEN（Read & Write 权限的 Access Token）
-#   两者都配齐才推 Docker Hub；GHCR 不需要任何 secret。
+#   两者缺任何一个，工作流直接失败（没有别的镜像目标可推）。
 
 on:
   repository_dispatch:
@@ -58,18 +62,12 @@ on:
         type: string
 
 env:
-  # 镜像归属：用户拉的那个仓库，不是运行本工作流的构建仓库。
-  # 换主仓库时改这两行（GHCR 的包命名空间跟着 owner 走）。
-  GHCR_OWNER: aimod-cc
-  GHCR_REPO: Agent2API
   # 源码：构建仓库里没有代码，要跨仓库 checkout 主仓库
   SOURCE_REPO: aimod-cc/Agent2API
   REF: ${{ github.event.client_payload.ref || github.event.inputs.ref }}
 
 permissions:
   contents: read
-  # 推 GHCR 需要（GITHUB_TOKEN 往包命名空间写）
-  packages: write
 
 jobs:
   image:
@@ -89,37 +87,28 @@ jobs:
       - name: 设置 buildx
         uses: docker/setup-buildx-action@v4
 
-      # 镜像目标是一份**新行分隔**的清单：GHCR 恒在，Docker Hub 看凭据。
-      # 组装成 step output 再交给 metadata-action（它的 images 本来就是这个形状），
-      # 于是 tag 规则（semver / latest / dev）只写一份、两个 registry 共用。
+      # 镜像目标交给 metadata-action（它的 images 本来就是这份清单的形状），
+      # tag 规则只写一处。
       #
-      # GHCR 的名字用 env 里的 owner/repo 拼，**不用 GITHUB_REPOSITORY** ——
-      # 本工作流跑在构建仓库，那个变量是构建仓库的名字（见文件头）。
+      # 没配 Docker Hub 凭据时**直接失败**：以前这里只是跳过推送、工作流照常
+      # 绿，结果是「构建成功但没人能拉到镜像」，而绿的运行看起来一切正常。
+      # 现在只有这一个目标，缺凭据就等于什么都没做，早点红比静默更诚实。
       - name: 组装镜像目标
         id: images
         run: |
-          images=("ghcr.io/${GHCR_OWNER}/${GHCR_REPO}")
-          if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ]; then
-            images+=("${DOCKERHUB_USERNAME}/agent2api")
+          set -euo pipefail
+          if [ -z "${DOCKERHUB_USERNAME:-}" ] || [ -z "${DOCKERHUB_TOKEN:-}" ]; then
+            echo "::error::缺 DOCKERHUB_USERNAME / DOCKERHUB_TOKEN —— 没有别的镜像目标，这一步不推就等于没构建"
+            exit 1
           fi
           {
             echo "list<<IMAGES"
-            printf '%s\n' "${images[@]}"
+            echo "${DOCKERHUB_USERNAME}/agent2api"
             echo "IMAGES"
           } >> "$GITHUB_OUTPUT"
-          echo "本次镜像目标："
-          printf '  %s\n' "${images[@]}"
+          echo "本次镜像目标：${DOCKERHUB_USERNAME}/agent2api"
 
-      - name: 登录 GHCR
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
-
-      # 没配 Docker Hub 凭据时整步跳过（工作流不会因此变红）
       - name: 登录 Docker Hub
-        if: env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != ''
         uses: docker/login-action@v4
         with:
           username: ${{ env.DOCKERHUB_USERNAME }}
