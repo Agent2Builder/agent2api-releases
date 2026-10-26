@@ -7,7 +7,7 @@ name: docker
 #   由主仓库推 `v*` tag 时派发过来的 `repository_dispatch` 触发。
 #
 #   · repository_dispatch（type=release）：产出 <版本号> 与 :latest
-#     预发布 tag（如 v3.1.0-beta.1）：只产出 <版本号>，**不移动 :latest**
+#     预发布 tag（如 v3.1.0-beta.1）：产出 <版本号> 与 :beta，**不移动 :latest**
 #   · 手动 workflow_dispatch：产出 :dev（移动测试 tag，不碰正式 tag）
 #
 #   为什么搬：镜像要编 amd64 + arm64 两个架构，是实打实的重负载；留在主仓库
@@ -156,12 +156,8 @@ jobs:
           echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
           echo "镜像版本 $VERSION（预发布=$PRERELEASE）"
 
-      # 正式版：<版本> + latest；beta：只出 <版本>（不移动 latest）
-      #
-      # latest **只跟正式版走**：beta tag（v3.1.0-beta.1）带 `-`，不移动 latest ——
-      # 应用里的「加入 beta 版」是一次显式选择，而 `docker pull :latest` 的人没做
-      # 这个选择；推一次 beta 就把 :latest 换掉等于绕过那道开关。beta 镜像照旧
-      # 会出 3.1.0-beta.1 这个版本 tag，想尝鲜的按版本号拉即可。
+      # latest 只跟正式版走；beta 只跟预发布版本走，不包含手动 dev 构建。
+      # 完整版本标签始终保留，便于固定版本。
       - name: 生成镜像 tag
         id: meta
         uses: docker/metadata-action@v6
@@ -170,6 +166,7 @@ jobs:
           tags: |
             type=raw,value=${{ steps.version.outputs.version }}
             type=raw,value=latest,enable=${{ steps.version.outputs.prerelease == 'false' }}
+            type=raw,value=beta,enable=${{ steps.version.outputs.prerelease == 'true' && steps.version.outputs.dev == 'false' }}
 
       - name: 构建并推送
         uses: docker/build-push-action@v7
