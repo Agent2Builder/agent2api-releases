@@ -1,0 +1,188 @@
+name: publish-installers
+
+# 发布收尾：把某一次「Release」构建 run 的产物挂成 GitHub Release，
+# 并同步一份到源码仓库（用户与贡献者习惯看那边的 Releases 页）。
+#
+# ── 为什么单独一个文件，而不是 release.yml 里的两个 job ─────────
+# 构建与发布的代价差三个数量级：构建是七个平台 + Android/iOS 签名（十几分钟），
+# 发布只是「下载十份附件 + 上传」（几十秒）。发布一旦塞进 release.yml 的 job 里，
+# 那一步出错就只剩「重跑整个工作流」一条路 —— 等于把七个平台再建一遍。而 tag 是
+# 发版动作、频率不可控，最坏会被判定成 Actions 滥用。分开之后：构建照常只跑
+# 一次，发布出错单独重跑本文件即可（见下面的 `only` 输入），不重新编译。
+#
+# ── 触发方式 ──────────────────────────────────────────────────
+#   · workflow_run（Release 完成）：tag 派发的构建成功后**自动发布** —— 这就是
+#     「推 tag → 出 Release + 同步主仓库」的全自动链路。只认 repository_dispatch
+#     触发的构建：手动构建不会自动发布，免得把分支快照发出去。
+#   · workflow_dispatch：手工补发 / 重跑。给 `run_id` 就发那次 run 的产物；
+#     `only` 可以只跑发布或只跑镜像。
+#
+# ── 两把凭据 ──────────────────────────────────────────────────
+#   GITHUB_TOKEN         —— 本仓库（构建仓库）的 Release，由下面 job 级
+#                           `permissions: contents: write` 授权
+#   SOURCE_RELEASE_TOKEN —— 源码仓库 aimod-cc/Agent2API 的 Release。源码仓库属于
+#                           主账号，本仓库的 GITHUB_TOKEN 够不着，必须用只授权
+#                           该仓库 Contents: write 的细粒度令牌。缺它时镜像那一步
+#                           明确失败，本仓库已发布的 Release 保留、用户更新不受影响。
+#
+# 附件口径：十份 = 桌面端 4（exe / dmg / deb / AppImage）+ 服务端 6（两架构
+# tar.gz 与 Windows zip，各带一份 .sha256）。手机端 APK / IPA 有意不挂 Release，
+# 只留 workflow artifact。清点与校验逻辑在 `.github/scripts/collect-assets.sh`。
+
+on:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: '要发布的构建 run 编号（留空则用触发本工作流的那次 run）'
+        required: false
+        type: string
+      tag:
+        description: '版本 tag（留空则从产物文件名里取）'
+        required: false
+        type: string
+      only:
+        description: '只跑哪一步（补镜像时选 mirror，不动已发布的正文与附件）'
+        required: false
+        type: choice
+        options: [both, publish, mirror]
+        default: both
+
+env:
+  SOURCE_REPO: aimod-cc/Agent2API
+  RUN_ID: ${{ inputs.run_id || github.event.workflow_run.id }}
+  GIVEN_TAG: ${{ inputs.tag }}
+  ONLY: ${{ inputs.only }}
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    # 自动触发只认「成功的 tag 派发构建」；手动触发一律执行
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      || (github.event.workflow_run.conclusion == 'success'
+          && github.event.workflow_run.event == 'repository_dispatch')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # 建 / 改本仓库的 Release
+      actions: read     # 取那次构建 run 的 artifact
+    steps:
+      # 本仓库：只为拿 .github/scripts/collect-assets.sh
+      - uses: actions/checkout@v7
+
+      - name: 取这次构建的产物
+        uses: actions/download-artifact@v8
+        with:
+          run-id: ${{ env.RUN_ID }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: dist
+
+      - name: 清点与校验附件
+        id: assets
+        run: |
+          set -euo pipefail
+          bash .github/scripts/collect-assets.sh dist
+          tag="v$(cat dist/version.txt)"
+          if [ -n "$GIVEN_TAG" ] && [ "$GIVEN_TAG" != "$tag" ]; then
+            echo "::error::指定的 tag（$GIVEN_TAG）与产物里的版本（$tag）对不上"
+            exit 1
+          fi
+          case "$tag" in
+            *-*) pre=true ;;
+            *)   pre=false ;;
+          esac
+          echo "tag=$tag"              >> "$GITHUB_OUTPUT"
+          echo "prerelease=$pre"       >> "$GITHUB_OUTPUT"
+          echo "→ 目标 $tag（预发布=$pre）"
+
+      # 源码仓库：只为拿正文（= tag 所指提交的提交信息）。两个仓库的正文逐字
+      # 相同，不追加任何指向对方的说明行。
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ steps.assets.outputs.tag }}
+          path: source
+          fetch-depth: 1
+
+      - name: 生成正文
+        run: |
+          set -euo pipefail
+          git -C source log -1 --format=%B > /tmp/notes.md
+          if [ ! -s /tmp/notes.md ]; then
+            echo "::error::${{ steps.assets.outputs.tag }} 的提交信息为空，无正文可发"
+            exit 1
+          fi
+          echo "正文首行：$(head -1 /tmp/notes.md)"
+
+      # ── 1. 本仓库的 Release ───────────────────────────────────
+      #
+      # 桌面端的更新检查读的就是这一份（`DEFAULT_REPO` 与索引 `app.json` 都指
+      # 这里），所以它必须先成、且附件齐全。
+      - name: 发布到本仓库
+        if: ${{ env.ONLY != 'mirror' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.assets.outputs.tag }}"
+          mapfile -t rels < dist/assets.txt
+          assets=(); for rel in "${rels[@]}"; do assets+=("dist/$rel"); done
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "→ Release $tag 已存在，逐个覆盖上传（重跑收尾安全）"
+          else
+            # 先建草稿：附件还在传的时候用户看不到它，避免「建出来了但少一半」
+            gh release create "$tag" --draft --title "$tag" --notes-file /tmp/notes.md
+            echo "→ 已建草稿 Release $tag"
+          fi
+
+          # 逐个上传，不一次传一批：一批时 gh 会在「某个附件已存在」上报 HTTP 422
+          # 并中断整批，症状是 Release 建好了、附件却少一半（2026-10-17 实测）
+          for asset in "${assets[@]}"; do
+            gh release upload "$tag" "$asset" --clobber
+          done
+
+          # 十份齐了才公开；beta 标预发布 —— 这个标记是应用里「加入 beta 版」
+          # 开关的分界线（正式通道 /releases/latest 排除预发布）
+          gh release edit "$tag" --prerelease="${{ steps.assets.outputs.prerelease }}" \
+            --draft=false --notes-file /tmp/notes.md
+          echo "→ 已发布 $tag（pre-release=${{ steps.assets.outputs.prerelease }}，${#assets[@]} 份附件）"
+
+      # ── 2. 同步到源码仓库 ─────────────────────────────────────
+      #
+      # 没有这一步，源码仓库的 Releases 页会空着（看着像「这个版本没发」），
+      # 但**更新检查不受影响** —— 它读的是本仓库那份。
+      - name: 镜像到源码仓库
+        if: ${{ env.ONLY != 'publish' }}
+        env:
+          GH_TOKEN: ${{ secrets.SOURCE_RELEASE_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.assets.outputs.tag }}"
+          repo="${{ env.SOURCE_REPO }}"
+          [ -n "${GH_TOKEN:-}" ] || { echo "::error::缺 SOURCE_RELEASE_TOKEN —— 无法同步 $repo"; exit 1; }
+
+          mapfile -t rels < dist/assets.txt
+          assets=(); for rel in "${rels[@]}"; do assets+=("dist/$rel"); done
+
+          if gh release view "$tag" --repo "$repo" >/dev/null 2>&1; then
+            echo "→ $repo 上已有 $tag，覆盖上传"
+          else
+            gh release create "$tag" --repo "$repo" --draft --title "$tag" \
+              --prerelease="${{ steps.assets.outputs.prerelease }}" --notes-file /tmp/notes.md
+            echo "→ $repo 上已建草稿 Release $tag"
+          fi
+
+          for asset in "${assets[@]}"; do
+            gh release upload "$tag" "$asset" --repo "$repo" --clobber
+          done
+
+          gh release edit "$tag" --repo "$repo" \
+            --prerelease="${{ steps.assets.outputs.prerelease }}" \
+            --draft=false --notes-file /tmp/notes.md
+          echo "→ 已同步 ${#assets[@]} 份附件到 $repo（pre-release=${{ steps.assets.outputs.prerelease }}）"
