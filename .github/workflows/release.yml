@@ -32,10 +32,12 @@ name: Release
 #   · 手动 workflow_dispatch（在 Actions 页面选分支触发）：
 #     各平台一起构建，产物作为 workflow artifact 下载，不发布 Release
 #   · 推送 v* tag：与 docker.yml 同时触发，一次打 tag 安装包与镜像全出；
-#     七个平台全部成功后，本文件的 `publish` job 把十份桌面 / 服务端附件挂到
-#     本仓库的 Release，`mirror` job 再用同一份清单与逐字相同的正文同步到源码
-#     仓库 —— 全程不需要本机参与。发版收尾脚本（scripts/release.sh）退为应急
-#     入口：正常发布不再由它上传，只有工作流不可用时才用它手工补发
+#     桌面端安装包与 Linux 服务端包只挂 workflow artifact —— GitHub
+#     Release 由发版收尾脚本在本地挂载（scripts/release.sh）：Release 本就
+#     不自动建，安装包只挂 artifact 让构建与发布解耦，发布那步重跑脚本即可
+#
+#     ⚠️ 2026-10-30 起改为自动：构建成功后 `publish-installers.yml` 接手发布，
+#     它由本工作流完成事件触发（`workflow_run`），发布那步可单独重跑
 #
 # ── action 版本为什么都钉在大版本 v7（本次升级）─────────────────
 # 原先用 checkout@v4 / setup-node@v4 / upload-artifact@v4，三者都跑在
@@ -81,15 +83,9 @@ name: Release
 
 # ── 触发方式（2026-10 改：构建搬到独立账号）──────────────────
 #   · repository_dispatch（type=release）：主仓库推 `v*` tag 时派发过来，
-#     payload 带 `{ref, version}`；七个构建 job 跑完由 `publish` + `mirror` 收尾
-#   · workflow_dispatch：手动补跑（选 ref；`publish` 开关关掉时只出 artifact）
-#
-# ── 发布为什么放在同一个文件里（不另起一个工作流）──────────────
-# 发布要的就是「刚才那七个 job 的产物」：同 run 里 `actions/download-artifact`
-# 直接取件，版本号与预发布标记也能从 `env.REF` 算出来。拆成 `workflow_run`
-# 触发的独立文件反而要跨 run 借件、还得从产物文件名里倒推版本号 —— 只为多一个
-# 文件，换来两处维护。收尾分成两个 job：`mirror` 单独重跑只影响源码仓库那份，
-# 本仓库已经发布的 Release 不受牵连。
+#     payload 带 `{ref, version}`；构建成功后 `publish-installers.yml` 自动发布
+#   · workflow_dispatch：手动补跑（选 ref，只构建；要发布再单独跑
+#     `publish-installers.yml`，传本次 run 的编号即可）
 #
 # 本文件运行在 **Agent2Builder/agent2api-releases**（专用构建仓库）上。
 # 主仓库只保留一条极轻的派发工作流，不再跑任何编译 —— 七个 job、三套平台
@@ -109,7 +105,7 @@ on:
         required: true
         type: string
       publish:
-        description: '发布为 Release（关闭则只上传 artifact）'
+        description: '（已停用：发布由 publish-installers.yml 负责，本开关不再生效；保留只为兼容既有手动触发命令）'
         required: false
         type: boolean
         default: true
@@ -776,188 +772,3 @@ jobs:
           name: ios-ipa
           path: dist/*
           if-no-files-found: error
-
-  # ── 发布：把本次 run 的产物挂成 Release（本仓库）──────────────
-  #
-  # 验收口径（与 `scripts/release.sh` 一致）：**恰好十份**附件，少一份就停 ——
-  # 少一份意味着某类用户下不到安装包，而「Release 建出来了」看起来一切正常，
-  # 属于最难查的那种静默故障。十份 = 桌面端 4（exe / dmg / deb / AppImage）
-  # + 服务端 6（两架构 tar.gz 与 Windows zip，各带一份 .sha256）。手机端
-  # APK / IPA **有意不挂**（只留 workflow artifact，见 `.agents/skills` 里的口径）。
-  publish:
-    needs: [macos, windows, linux-desktop, linux-server, windows-server, android, ios]
-    # tag 派发一律发布；手动触发时由 `publish` 开关决定（关掉就只留 artifact）
-    if: ${{ github.event_name == 'repository_dispatch' || inputs.publish }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write     # 建 / 改本仓库的 Release
-      actions: read       # 取本次 run 的 artifact
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          repository: ${{ env.SOURCE_REPO }}
-          ref: ${{ env.REF }}
-
-      # 版本号与预发布标记**从 ref 算**，不看 `github.ref`：本工作流跑在构建
-      # 仓库的 main 上，`github.ref` 恒为 `refs/heads/main`（与 docker.yml 同一个坑）。
-      - name: 解析版本
-        env:
-          REF: ${{ env.REF }}
-        run: |
-          set -euo pipefail
-          case "$REF" in
-            v*) VERSION="${REF#v}" ;;
-            *)  echo "::error::ref 不是 v* tag 形式：$REF"; exit 1 ;;
-          esac
-          case "$VERSION" in
-            *-*) PRE=true ;;
-            *)   PRE=false ;;
-          esac
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "prerelease=$PRE"  >> "$GITHUB_OUTPUT"
-          echo "→ 发布 $VERSION（预发布=$PRE，源码提交 $(git rev-parse --short HEAD)）"
-
-      - name: 下载本次 run 的全部产物
-        uses: actions/download-artifact@v8
-        with:
-          path: dist
-
-      - name: 清点附件（恰好十份）
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          assets=()
-          # 桌面端 4 份
-          for f in dist/windows-nsis/*.exe;      do assets+=("$f"); done
-          for f in dist/macos-universal/*.dmg;   do assets+=("$f"); done
-          # linux-desktop 的上传路径是 target/release/bundle/{deb,appimage}/*，包根
-          # 取最近公共祖先，于是解出来是 dist/linux-desktop/{deb,appimage}/… ——
-          # 不能按平层扫（2026-10-17 实测：Release 建出来了却没有 deb/AppImage）
-          for f in dist/linux-desktop/*/*.deb dist/linux-desktop/*/*.AppImage; do assets+=("$f"); done
-          # 服务端 6 份
-          for f in dist/linux-server-amd64/* dist/linux-server-arm64/* dist/windows-server-amd64/*; do assets+=("$f"); done
-
-          if [ "${#assets[@]}" -ne 10 ]; then
-            echo "::error::附件不是十份（实际 ${#assets[@]} 份），拒绝发布："
-            printf '  %s\n' "${assets[@]}"
-            exit 1
-          fi
-
-          # 服务端包的校验文件必须与包本身对得上：面板拿这个值判断安装包是否
-          # 完整，对不上就不该发出去（工件坏了、或上传被截断）。
-          #
-          # 不用 `sha256sum -c`：Windows job 上那份 .sha256 是 PowerShell 生成的，
-          # 行尾是 CRLF，`-c` 会把 `\r` 当成文件名的一部分而报
-          # “‘xxx.zip\r’: No such file or directory”（2026-10-30 本地实测）。
-          # 这里只取首个字段比对，末尾多了什么字符都不影响。
-          for sum in dist/linux-server-amd64/*.sha256 dist/linux-server-arm64/*.sha256 dist/windows-server-amd64/*.sha256; do
-            pkg="${sum%.sha256}"
-            [ -f "$pkg" ] || { echo "::error::$(basename "$sum") 存在但对应的包不在"; exit 1; }
-            want="$(tr -d '\r' < "$sum" | awk 'NR == 1 { print $1 }')"
-            got="$(sha256sum "$pkg" | awk '{ print $1 }')"
-            if [ "$want" != "$got" ]; then
-              echo "::error::$(basename "$pkg") 的 sha256 对不上（校验文件 $want，实际 $got）"
-              exit 1
-            fi
-            echo "  OK $(basename "$pkg")"
-          done
-
-          # 清单落盘并作为 artifact 带出去：mirror job 直接复用这份结果，省得把
-          # 上面这段筛选逻辑在两个 job 里各写一遍
-          printf '%s\n' "${assets[@]}" > dist/assets.txt
-          printf '  %s\n' "${assets[@]}"
-
-      - name: 记下附件清单（供 mirror 复用）
-        uses: actions/upload-artifact@v7
-        with:
-          name: release-assets
-          path: dist/assets.txt
-          if-no-files-found: error
-
-      # 正文 = tag 所指提交的提交信息（= 这次的更新日志）。两个仓库的正文逐字
-      # 相同，不追加任何指向对方的说明行。
-      - name: 建 / 更新 Release（先草稿，齐了再公开）
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          tag="${{ env.REF }}"
-          mapfile -t assets < dist/assets.txt
-          git log -1 --format=%B "$tag" > /tmp/notes.md
-          [ -s /tmp/notes.md ] || { echo "::error::$tag 的提交信息为空，无正文可发"; exit 1; }
-
-          if gh release view "$tag" >/dev/null 2>&1; then
-            echo "→ Release $tag 已存在，逐个覆盖上传（重跑收尾安全）"
-          else
-            # 先草稿：附件还在传的时候用户看不到这个版本，避免「建出来了但少一半」
-            gh release create "$tag" --draft --title "$tag" --notes-file /tmp/notes.md
-            echo "→ 已建草稿 Release $tag"
-          fi
-
-          # 逐个上传，不一次传一批：一批时 gh 会在「某个附件已存在」上报 HTTP 422
-          # 并中断整批，症状是 Release 建好了附件却少一半（2026-10-17 实测）
-          for asset in "${assets[@]}"; do
-            gh release upload "$tag" "$asset" --clobber
-          done
-
-          # 十份齐了才公开。beta 标预发布 —— 这个标记是「加入 beta 版」开关的
-          # 分界线，正式通道（/releases/latest）排除预发布。
-          gh release edit "$tag" --prerelease="${{ steps.version.outputs.prerelease }}" \
-            --draft=false --notes-file /tmp/notes.md
-          echo "→ 已发布 $tag（pre-release=${{ steps.version.outputs.prerelease }}，附件 ${#assets[@]} 份）"
-
-  # ── 镜像：同一份附件与正文，同步到源码仓库 ───────────────────
-  #
-  # 为什么必须镜像：桌面端的更新检查读的是**本仓库**（`DEFAULT_REPO` 与索引
-  # `app.json` 都指这边），所以本仓库这份是「能收到更新」的那一份；而用户与
-  # 贡献者习惯看源码仓库的 Releases 页，那里空着会被当成「这个版本没发」。
-  #
-  # 权限：源码仓库属于主账号，本仓库的 GITHUB_TOKEN 够不着 —— 用
-  # `SOURCE_RELEASE_TOKEN`（只授权 aimod-cc/Agent2API 的 contents: write）。
-  # 缺它时本 job 明确失败，本仓库已经发布的 Release 不受影响，单独重跑本 job 即可。
-  mirror:
-    needs: [publish]
-    if: ${{ needs.publish.result == 'success' }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          repository: ${{ env.SOURCE_REPO }}
-          ref: ${{ env.REF }}
-
-      - name: 下载产物与附件清单
-        uses: actions/download-artifact@v8
-        with:
-          path: dist
-
-      - name: 镜像到源码仓库
-        env:
-          GH_TOKEN: ${{ secrets.SOURCE_RELEASE_TOKEN }}
-        run: |
-          set -euo pipefail
-          tag="${{ env.REF }}"
-          repo="${{ env.SOURCE_REPO }}"
-          [ -n "${GH_TOKEN:-}" ] || { echo "::error::缺 SOURCE_RELEASE_TOKEN —— 无法同步 $repo"; exit 1; }
-          [ -f dist/release-assets/assets.txt ] || { echo "::error::没有附件清单：publish 是不是没跑成功？"; exit 1; }
-          case "${tag#v}" in
-            *-*) PRE=true ;;
-            *)   PRE=false ;;
-          esac
-
-          mapfile -t rels < dist/release-assets/assets.txt
-          assets=()
-          for rel in "${rels[@]}"; do assets+=("dist/$rel"); done
-          git log -1 --format=%B "$tag" > /tmp/notes.md
-
-          if gh release view "$tag" --repo "$repo" >/dev/null 2>&1; then
-            echo "→ $repo 上已有 $tag，覆盖上传"
-            gh release edit "$tag" --repo "$repo" --prerelease="$PRE" --notes-file /tmp/notes.md
-          else
-            gh release create "$tag" --repo "$repo" --draft --title "$tag" --notes-file /tmp/notes.md
-            echo "→ $repo 上已建草稿 Release $tag"
-          fi
-          for asset in "${assets[@]}"; do
-            gh release upload "$tag" "$asset" --repo "$repo" --clobber
-          done
-          gh release edit "$tag" --repo "$repo" --prerelease="$PRE" --draft=false --notes-file /tmp/notes.md
-          echo "→ 已同步 ${#assets[@]} 个附件到 $repo（pre-release=$PRE）"
