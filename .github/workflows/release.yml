@@ -119,10 +119,15 @@ env:
 jobs:
   # ── macOS ─────────────────────────────────────────────────
   macos:
-    # macos-latest 是 Apple Silicon（M1）。这里用 universal 目标同时产出
-    # x86_64 与 aarch64 两个架构并合并，Intel 与 M 芯片都能原生运行 ——
-    # 代价是 Rust 部分要编两遍，缓存命中时约十几分钟。
-    runs-on: macos-latest
+    # 用 universal 目标同时产出 x86_64 与 aarch64 两个架构并合并，Intel 与 M
+    # 芯片都能原生运行 —— 代价是 Rust 部分要编两遍，缓存命中时约十几分钟。
+    #
+    # 标签写死 macos-26 而不是 macos-latest：两者当前都指向 macOS 26 arm64，
+    # 但 macos-latest 这个通配标签在 arm64 池子里排队极久 —— 实测连续三次等待
+    # 约 15 分钟后被 cancelled，runner_name 始终为空（GitHub 注解只提示
+    # 「arm64 runners may experience longer queue times」）。同一批构建里 iOS
+    # job 用 macos-26 就分到了机器，因此这里跟它保持一致。
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v7
         with:
