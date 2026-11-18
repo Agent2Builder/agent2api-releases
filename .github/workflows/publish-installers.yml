@@ -1,34 +1,7 @@
 name: publish-installers
 
-# 发布收尾：把某一次「Release」构建 run 的产物挂成 GitHub Release，
-# 并同步一份到源码仓库（用户与贡献者习惯看那边的 Releases 页）。
-#
-# ── 为什么单独一个文件，而不是 release.yml 里的两个 job ─────────
-# 构建与发布的代价差三个数量级：构建是七个平台 + Android/iOS 签名（十几分钟），
-# 发布只是「下载十份附件 + 上传」（几十秒）。发布一旦塞进 release.yml 的 job 里，
-# 那一步出错就只剩「重跑整个工作流」一条路 —— 等于把七个平台再建一遍。而 tag 是
-# 发版动作、频率不可控，最坏会被判定成 Actions 滥用。分开之后：构建照常只跑
-# 一次，发布出错单独重跑本文件即可（见下面的 `only` 输入），不重新编译。
-#
-# ── 触发方式 ──────────────────────────────────────────────────
-#   · workflow_run（Release 完成）：tag 派发的构建成功后**自动发布** —— 这就是
-#     「推 tag → 出 Release + 同步主仓库」的全自动链路。只认 repository_dispatch
-#     触发的构建：手动构建不会自动发布，免得把分支快照发出去。
-#   · workflow_dispatch：手工补发 / 重跑。给 `run_id` 就发那次 run 的产物；
-#     `only` 可以只跑发布或只跑镜像。
-#
-# ── 两把凭据 ──────────────────────────────────────────────────
-#   GITHUB_TOKEN         —— 本仓库（构建仓库）的 Release，由下面 job 级
-#                           `permissions: contents: write` 授权
-#   SOURCE_RELEASE_TOKEN —— 源码仓库 aimod-cc/Agent2API 的 Release。源码仓库属于
-#                           主账号，本仓库的 GITHUB_TOKEN 够不着，必须用只授权
-#                           该仓库 Contents: write 的细粒度令牌。缺它时镜像那一步
-#                           明确失败，本仓库已发布的 Release 保留、用户更新不受影响。
-#
-# 附件口径：十份 = 桌面端 4（exe / dmg / deb / AppImage）+ 服务端 6（两架构
-# tar.gz 与 Windows zip，各带一份 .sha256）。手机端 APK / IPA 有意不挂 Release，
-# 只留 workflow artifact。清点与校验逻辑在 `.github/scripts/collect-assets.sh`。
-
+# 官网发布与源码仓库镜像独立收尾；只重跑失败的任务，不重新编译。
+# 十份公开文件 = 四份桌面安装包 + 三份服务端包及各自校验文件；手机包仍只留构建产物。
 on:
   workflow_run:
     workflows: ["Release"]
@@ -37,19 +10,26 @@ on:
   workflow_dispatch:
     inputs:
       run_id:
-        description: '要发布的构建 run 编号（留空则用触发本工作流的那次 run）'
-        required: false
+        description: '成功的原始 Release 构建编号'
+        required: true
         type: string
       tag:
         description: '版本 tag（留空则从产物文件名里取）'
         required: false
         type: string
       only:
-        description: '只跑哪一步（补镜像时选 mirror，不动已发布的正文与附件）'
+        description: 'both 全部、publish GitHub+官网、mirror 源码镜像、website 仅重发官网通知'
         required: false
         type: choice
-        options: [both, publish, mirror]
+        options: [both, publish, mirror, website]
         default: both
+
+concurrency:
+  group: publish-installers-${{ inputs.run_id || github.event.workflow_run.id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
 
 env:
   SOURCE_REPO: aimod-cc/Agent2API
@@ -57,132 +37,217 @@ env:
   GIVEN_TAG: ${{ inputs.tag }}
   ONLY: ${{ inputs.only }}
 
-permissions:
-  contents: read
-
 jobs:
-  release:
-    # 自动触发只认「成功的 tag 派发构建」；手动触发一律执行
+  prepare:
     if: >-
       github.event_name == 'workflow_dispatch'
       || (github.event.workflow_run.conclusion == 'success'
           && github.event.workflow_run.event == 'repository_dispatch')
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
-      contents: write   # 建 / 改本仓库的 Release
-      actions: read     # 取那次构建 run 的 artifact
+      contents: read
+      actions: read
+    outputs:
+      tag: ${{ steps.assets.outputs.tag }}
+      artifact: ${{ steps.assets.outputs.artifact }}
     steps:
-      # 本仓库：只为拿 .github/scripts/collect-assets.sh
       - uses: actions/checkout@v7
+        with:
+          ref: main
+          persist-credentials: false
 
-      - name: 取这次构建的产物
+      - name: 核对原始构建
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 .github/scripts/github-release.py validate-run --run-id "$RUN_ID"
+
+      - name: 校验官网发布连接
+        if: ${{ env.ONLY != 'mirror' }}
+        env:
+          RELEASE_PUBLISH_SECRET: ${{ secrets.RELEASE_PUBLISH_SECRET }}
+        run: python3 .github/scripts/website-release.py check
+
+      - name: 取原始构建的电脑端与服务端产物
+        if: ${{ env.ONLY != 'website' }}
         uses: actions/download-artifact@v8
         with:
           run-id: ${{ env.RUN_ID }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
+          pattern: '{windows-nsis,macos-universal,linux-desktop,linux-server-amd64,linux-server-arm64,windows-server-amd64}'
           path: dist
 
-      - name: 清点与校验附件
+      - name: 清点文件并确定版本
         id: assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          bash .github/scripts/collect-assets.sh dist
-          tag="v$(cat dist/version.txt)"
-          if [ -n "$GIVEN_TAG" ] && [ "$GIVEN_TAG" != "$tag" ]; then
-            echo "::error::指定的 tag（$GIVEN_TAG）与产物里的版本（$tag）对不上"
-            exit 1
+          if [ "$ONLY" = website ]; then
+            tag="$GIVEN_TAG"
+            [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9]+([.-][A-Za-z0-9]+)*)?(\+[A-Za-z0-9]+([.-][A-Za-z0-9]+)*)?$ ]] || {
+              printf '%s\n' '只重发官网通知时必须填写完整版本 tag' >&2; exit 1;
+            }
+          else
+            bash .github/scripts/collect-assets.sh dist
+            tag="v$(<dist/version.txt)"
+            if [ -n "$GIVEN_TAG" ] && [ "$GIVEN_TAG" != "$tag" ]; then
+              printf '%s\n' '指定 tag 与原始构建版本不一致' >&2; exit 1
+            fi
+            mkdir release-assets
+            while IFS= read -r relative; do
+              cp "dist/$relative" release-assets/
+            done < dist/assets.txt
+            cp dist/version.txt release-assets/
+            find release-assets -maxdepth 1 -type f ! -name version.txt ! -name assets.txt ! -name notes.md -printf '%f\n' | sort > release-assets/assets.txt
           fi
-          case "$tag" in
-            *-*) pre=true ;;
-            *)   pre=false ;;
-          esac
-          echo "tag=$tag"              >> "$GITHUB_OUTPUT"
-          echo "prerelease=$pre"       >> "$GITHUB_OUTPUT"
-          echo "→ 目标 $tag（预发布=$pre）"
+          printf 'tag=%s\n' "$tag" >> "$GITHUB_OUTPUT"
+          printf 'artifact=release-files-%s\n' "$RUN_ID" >> "$GITHUB_OUTPUT"
 
-      # 源码仓库：只为拿正文（= tag 所指提交的提交信息）。两个仓库的正文逐字
-      # 相同，不追加任何指向对方的说明行。
-      - uses: actions/checkout@v7
+      - name: 读取源码版本的发布正文
+        if: ${{ env.ONLY != 'website' }}
+        uses: actions/checkout@v7
         with:
           repository: ${{ env.SOURCE_REPO }}
           ref: ${{ steps.assets.outputs.tag }}
           path: source
           fetch-depth: 1
+          persist-credentials: false
 
-      - name: 生成正文
+      - name: 保存同一份发布正文
+        if: ${{ env.ONLY != 'website' }}
         run: |
           set -euo pipefail
-          git -C source log -1 --format=%B > /tmp/notes.md
-          if [ ! -s /tmp/notes.md ]; then
-            echo "::error::${{ steps.assets.outputs.tag }} 的提交信息为空，无正文可发"
-            exit 1
-          fi
-          echo "正文首行：$(head -1 /tmp/notes.md)"
+          git -C source log -1 --format=%B > release-assets/notes.md
+          test -s release-assets/notes.md
 
-      # ── 1. 本仓库的 Release ───────────────────────────────────
-      #
-      # 桌面端的更新检查读的就是这一份（`DEFAULT_REPO` 与索引 `app.json` 都指
-      # 这里），所以它必须先成、且附件齐全。
-      - name: 发布到本仓库
-        if: ${{ env.ONLY != 'mirror' }}
+      - name: 保存收尾共用的十份文件
+        if: ${{ env.ONLY != 'website' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.assets.outputs.artifact }}
+          path: release-assets/*
+          compression-level: 0
+          retention-days: 7
+          overwrite: true
+          if-no-files-found: error
+
+  publish:
+    needs: prepare
+    if: ${{ needs.prepare.result == 'success' && inputs.only != 'mirror' && inputs.only != 'website' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ needs.prepare.outputs.artifact }}
+          path: release-assets
+
+      - name: 安装 R2 上传工具
+        run: python3 -m pip install --disable-pip-version-check boto3==1.44.1
+
+      - name: 将十份原始文件上传到 R2
+        env:
+          R2_ENDPOINT: ${{ vars.R2_ENDPOINT }}
+          R2_BUCKET_NAME: ${{ vars.R2_BUCKET_NAME }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          RELEASE_PUBLISH_SECRET: ${{ secrets.RELEASE_PUBLISH_SECRET }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: python3 .github/scripts/website-release.py prepare --directory release-assets --tag "$TAG" --manifest r2-manifest.json
+
+      - name: 发布到构建仓库
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          tag="${{ steps.assets.outputs.tag }}"
-          mapfile -t rels < dist/assets.txt
-          assets=(); for rel in "${rels[@]}"; do assets+=("dist/$rel"); done
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: python3 .github/scripts/github-release.py publish --directory release-assets --tag "$TAG"
 
-          if gh release view "$tag" >/dev/null 2>&1; then
-            echo "→ Release $tag 已存在，逐个覆盖上传（重跑收尾安全）"
-          else
-            # 先建草稿：附件还在传的时候用户看不到它，避免「建出来了但少一半」
-            gh release create "$tag" --draft --title "$tag" --notes-file /tmp/notes.md
-            echo "→ 已建草稿 Release $tag"
-          fi
+      - name: 保存官网发布清单
+        uses: actions/upload-artifact@v7
+        with:
+          name: website-manifest-${{ env.RUN_ID }}
+          path: r2-manifest.json
+          retention-days: 7
+          overwrite: true
+          if-no-files-found: error
 
-          # 逐个上传，不一次传一批：一批时 gh 会在「某个附件已存在」上报 HTTP 422
-          # 并中断整批，症状是 Release 建好了、附件却少一半（2026-10-17 实测）
-          for asset in "${assets[@]}"; do
-            gh release upload "$tag" "$asset" --clobber
-          done
+  website:
+    needs: [prepare, publish]
+    if: >-
+      always() && needs.prepare.result == 'success' && inputs.only != 'mirror'
+      && (inputs.only == 'website' || needs.publish.result == 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          persist-credentials: false
 
-          # 十份齐了才公开；beta 标预发布 —— 这个标记是应用里「加入 beta 版」
-          # 开关的分界线（正式通道 /releases/latest 排除预发布）
-          gh release edit "$tag" --prerelease="${{ steps.assets.outputs.prerelease }}" \
-            --draft=false --notes-file /tmp/notes.md
-          echo "→ 已发布 $tag（pre-release=${{ steps.assets.outputs.prerelease }}，${#assets[@]} 份附件）"
+      - name: 读取本轮官网发布清单
+        if: ${{ env.ONLY != 'website' }}
+        uses: actions/download-artifact@v8
+        with:
+          name: website-manifest-${{ env.RUN_ID }}
 
-      # ── 2. 同步到源码仓库 ─────────────────────────────────────
-      #
-      # 没有这一步，源码仓库的 Releases 页会空着（看着像「这个版本没发」），
-      # 但**更新检查不受影响** —— 它读的是本仓库那份。
-      - name: 镜像到源码仓库
-        if: ${{ env.ONLY != 'publish' }}
+      - name: 通知官网开放完整版本
+        if: ${{ env.ONLY != 'website' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_PUBLISH_SECRET: ${{ secrets.RELEASE_PUBLISH_SECRET }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: python3 .github/scripts/website-release.py publish --tag "$TAG" --manifest r2-manifest.json --run-id "$RUN_ID"
+
+      - name: 安装 R2 校验工具
+        if: ${{ env.ONLY == 'website' }}
+        run: python3 -m pip install --disable-pip-version-check boto3==1.44.1
+
+      - name: 只重新核对存储并通知官网
+        if: ${{ env.ONLY == 'website' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          R2_ENDPOINT: ${{ vars.R2_ENDPOINT }}
+          R2_BUCKET_NAME: ${{ vars.R2_BUCKET_NAME }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          RELEASE_PUBLISH_SECRET: ${{ secrets.RELEASE_PUBLISH_SECRET }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: python3 .github/scripts/website-release.py register --tag "$TAG" --run-id "$RUN_ID"
+
+  mirror:
+    needs: [prepare, publish]
+    if: >-
+      always() && needs.prepare.result == 'success'
+      && (inputs.only == 'mirror' || (inputs.only != 'publish' && inputs.only != 'website' && needs.publish.result == 'success'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ needs.prepare.outputs.artifact }}
+          path: release-assets
+
+      - name: 镜像相同附件和正文到源码仓库
         env:
           GH_TOKEN: ${{ secrets.SOURCE_RELEASE_TOKEN }}
-        run: |
-          set -euo pipefail
-          tag="${{ steps.assets.outputs.tag }}"
-          repo="${{ env.SOURCE_REPO }}"
-          [ -n "${GH_TOKEN:-}" ] || { echo "::error::缺 SOURCE_RELEASE_TOKEN —— 无法同步 $repo"; exit 1; }
-
-          mapfile -t rels < dist/assets.txt
-          assets=(); for rel in "${rels[@]}"; do assets+=("dist/$rel"); done
-
-          if gh release view "$tag" --repo "$repo" >/dev/null 2>&1; then
-            echo "→ $repo 上已有 $tag，覆盖上传"
-          else
-            gh release create "$tag" --repo "$repo" --draft --title "$tag" \
-              --prerelease="${{ steps.assets.outputs.prerelease }}" --notes-file /tmp/notes.md
-            echo "→ $repo 上已建草稿 Release $tag"
-          fi
-
-          for asset in "${assets[@]}"; do
-            gh release upload "$tag" "$asset" --repo "$repo" --clobber
-          done
-
-          gh release edit "$tag" --repo "$repo" \
-            --prerelease="${{ steps.assets.outputs.prerelease }}" \
-            --draft=false --notes-file /tmp/notes.md
-          echo "→ 已同步 ${#assets[@]} 份附件到 $repo（pre-release=${{ steps.assets.outputs.prerelease }}）"
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: python3 .github/scripts/github-release.py mirror --directory release-assets --tag "$TAG"

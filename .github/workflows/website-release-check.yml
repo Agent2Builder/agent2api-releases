@@ -1,0 +1,22 @@
+name: Website release connection check
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: 验证官网发布密钥、数据库与 R2 绑定
+        env:
+          RELEASE_PUBLISH_SECRET: ${{ secrets.RELEASE_PUBLISH_SECRET }}
+        run: python3 .github/scripts/website-release.py check
