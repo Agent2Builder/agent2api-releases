@@ -1,0 +1,245 @@
+name: R2 configuration check
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 安装 R2 连接工具
+        run: python3 -m pip install --disable-pip-version-check boto3==1.44.1
+
+      - name: 验证上传、读取、完整性与临时文件清理
+        env:
+          R2_ENDPOINT: ${{ vars.R2_ENDPOINT }}
+          R2_BUCKET_NAME: ${{ vars.R2_BUCKET_NAME }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          python3 - <<'PY'
+          import base64
+          import hashlib
+          import os
+          import re
+          import sys
+          import uuid
+          from urllib.parse import urlsplit
+
+          import boto3
+          from botocore.config import Config
+          from botocore.exceptions import ClientError
+
+          results = []
+          stage = "配置检查"
+          failure = None
+          cleanup_errors = []
+          client = None
+          bucket = ""
+          keys = []
+          check_id = str(uuid.uuid4())
+          payload = b"Agent2API R2 configuration check\n" + os.urandom(1024)
+          digest = hashlib.sha256(payload).digest()
+          checksum = base64.b64encode(digest).decode("ascii")
+          metadata = {
+              "diagnostic": "agent2api-r2-check",
+              "check-id": check_id,
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "run-id": os.environ["GITHUB_RUN_ID"],
+          }
+
+          def record(message):
+              results.append(message)
+              print("PASS: " + message, flush=True)
+
+          def describe(error):
+              if isinstance(error, ClientError):
+                  status = error.response.get("ResponseMetadata", {}).get("HTTPStatusCode", "?")
+                  code = error.response.get("Error", {}).get("Code", "Unknown")
+                  return f"HTTP {status}, {code}"
+              message = str(error)
+              for name in ("R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY"):
+                  secret = os.environ.get(name, "")
+                  if secret:
+                      message = message.replace(secret, "[redacted]")
+              return f"{type(error).__name__}: {message}".replace("\n", " ")[:500]
+
+          def not_found(error):
+              return error.response.get("ResponseMetadata", {}).get("HTTPStatusCode") == 404
+
+          def read_object(key, **options):
+              response = client.get_object(Bucket=bucket, Key=key, **options)
+              try:
+                  return response["Body"].read(len(payload) + 1)
+              finally:
+                  response["Body"].close()
+
+          def cleanup(key):
+              try:
+                  head = client.head_object(Bucket=bucket, Key=key)
+              except ClientError as error:
+                  if not_found(error):
+                      return
+                  raise
+              # 只清理本轮创建的内容，不按目录批量删除。
+              if head.get("Metadata") != metadata or read_object(key) != payload:
+                  raise RuntimeError("临时文件的标记或内容变化，已停止删除")
+              client.delete_object(Bucket=bucket, Key=key)
+              try:
+                  client.head_object(Bucket=bucket, Key=key)
+              except ClientError as error:
+                  if not_found(error):
+                      return
+                  raise
+              raise RuntimeError("临时文件删除后仍然存在")
+
+          try:
+              required = ("R2_ENDPOINT", "R2_BUCKET_NAME", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY")
+              for name in required:
+                  value = os.environ.get(name, "")
+                  if not value:
+                      raise RuntimeError(f"缺少 {name}")
+                  if value != value.strip():
+                      raise RuntimeError(f"{name} 首尾有多余空白")
+              endpoint = os.environ["R2_ENDPOINT"].rstrip("/")
+              parsed = urlsplit(endpoint)
+              if (parsed.scheme != "https" or parsed.username or parsed.password
+                  or parsed.port or parsed.path or parsed.query or parsed.fragment
+                  or not re.fullmatch(r"[a-f0-9]{32}(?:\.(?:eu|fedramp))?\.r2\.cloudflarestorage\.com", parsed.hostname or "")):
+                  raise RuntimeError("R2_ENDPOINT 不是不带存储桶路径的 R2 S3 地址")
+              bucket = os.environ["R2_BUCKET_NAME"]
+              if bucket != "yuyi":
+                  raise RuntimeError("R2_BUCKET_NAME 与现有官网使用的 yuyi 不一致")
+              record("四项配置存在，上传地址及存储桶名称正确")
+
+              client = boto3.client(
+                  "s3",
+                  endpoint_url=endpoint,
+                  region_name="auto",
+                  aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],
+                  aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"],
+                  config=Config(
+                      signature_version="s3v4",
+                      s3={"addressing_style": "path", "payload_signing_enabled": False},
+                      request_checksum_calculation="when_required",
+                      response_checksum_validation="when_required",
+                      connect_timeout=10,
+                      read_timeout=30,
+                      retries={"total_max_attempts": 3, "mode": "standard"},
+                  ),
+              )
+              prefix = f"agent2api/diagnostics/r2/{os.environ['GITHUB_RUN_ID']}/{check_id}/"
+              key = prefix + "connection.bin"
+              rejected_key = prefix + "invalid-checksum.bin"
+              stage = "密钥与读取权限"
+              try:
+                  client.head_object(Bucket=bucket, Key=key)
+              except ClientError as error:
+                  if not not_found(error):
+                      raise
+              else:
+                  raise RuntimeError("随机临时文件路径已存在，已停止写入")
+              record("密钥鉴权和存储桶读取权限通过")
+
+              stage = "文件上传"
+              keys.append(key)
+              client.put_object(
+                  Bucket=bucket,
+                  Key=key,
+                  Body=payload,
+                  ContentLength=len(payload),
+                  ContentType="application/octet-stream",
+                  Metadata=metadata,
+                  ChecksumSHA256=checksum,
+                  IfNoneMatch="*",
+              )
+              record("临时文件上传成功")
+
+              stage = "存储端完整文件校验"
+              head = client.head_object(Bucket=bucket, Key=key, ChecksumMode="ENABLED")
+              if head.get("ContentLength") != len(payload):
+                  raise RuntimeError("存储文件大小与原文件不一致")
+              if head.get("ChecksumSHA256") != checksum:
+                  raise RuntimeError("存储端未返回匹配的完整 SHA-256 校验值")
+              if head.get("Metadata") != metadata:
+                  raise RuntimeError("存储端文件标记未能完整保存")
+              record("文件大小、完整 SHA-256 校验值和文件标记一致")
+
+              stage = "文件下载"
+              received = read_object(key)
+              if received != payload or hashlib.sha256(received).digest() != digest:
+                  raise RuntimeError("下载内容与上传原文件不一致")
+              if read_object(key, Range="bytes=0-31") != payload[:32]:
+                  raise RuntimeError("分段读取内容不一致")
+              record("完整下载和分段读取均与原文件一致")
+
+              stage = "防止覆盖已有对象"
+              try:
+                  client.put_object(
+                      Bucket=bucket,
+                      Key=key,
+                      Body=payload,
+                      ContentLength=len(payload),
+                      Metadata=metadata,
+                      ChecksumSHA256=checksum,
+                      IfNoneMatch="*",
+                  )
+              except ClientError as error:
+                  if error.response.get("ResponseMetadata", {}).get("HTTPStatusCode") != 412:
+                      raise
+              else:
+                  raise RuntimeError("存储端没有拒绝覆盖已有对象的请求")
+              record("仅创建、不覆盖的上传保护生效")
+
+              stage = "拒绝错误的文件校验值"
+              keys.append(rejected_key)
+              wrong_checksum = base64.b64encode(hashlib.sha256(b"incorrect checksum").digest()).decode("ascii")
+              try:
+                  client.put_object(
+                      Bucket=bucket,
+                      Key=rejected_key,
+                      Body=payload,
+                      ContentLength=len(payload),
+                      Metadata=metadata,
+                      ChecksumSHA256=wrong_checksum,
+                      IfNoneMatch="*",
+                  )
+              except ClientError as error:
+                  code = error.response.get("Error", {}).get("Code", "")
+                  status = error.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+                  if status != 400 or code not in ("BadDigest", "InvalidDigest", "XAmzContentSHA256Mismatch"):
+                      raise
+              else:
+                  raise RuntimeError("存储端接受了错误的 SHA-256 校验值")
+              record("错误的完整文件校验值被存储端拒绝")
+          except Exception as error:
+              failure = f"{stage}失败：{describe(error)}"
+              print("::error::" + failure, flush=True)
+          finally:
+              if client is not None:
+                  for key in keys:
+                      try:
+                          cleanup(key)
+                      except Exception as error:
+                          message = f"临时文件清理失败 {key}：{describe(error)}"
+                          cleanup_errors.append(message)
+                          print("::error::" + message, flush=True)
+                  if keys and not cleanup_errors:
+                      record("本轮临时文件已清理，删除后不存在")
+                  client.close()
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+                  summary.write("## R2 配置检查\n\n")
+                  summary.write("不构建安装包、不创建版本、不修改官网发布记录。\n\n")
+                  for result in results:
+                      summary.write(f"- ✅ {result}\n")
+                  if failure:
+                      summary.write(f"- ❌ {failure}\n")
+                  for error in cleanup_errors:
+                      summary.write(f"- ❌ {error}\n")
+              if failure or cleanup_errors:
+                  sys.exit(1)
+          PY
