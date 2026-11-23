@@ -13,7 +13,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 RELEASE_ENDPOINT = "https://oyl.agent2api.dev/api/ci/releases"
 RELEASE_CHECK_ENDPOINT = RELEASE_ENDPOINT + "/check"
-RELEASE_FILE_COUNT = 10
+MOBILE_RELEASE_MIN_VERSION = "3.5.0-beta.8"
 MAX_INSTALLER_BYTES = 600 * 1024 * 1024
 TAG_PATTERN = re.compile(
     r"v\d+\.\d+\.\d+(?:-[A-Za-z0-9]+(?:[.-][A-Za-z0-9]+)*)?"
@@ -41,6 +41,40 @@ def validate_tag(tag):
     return tag
 
 
+def _parse_version(raw):
+    text = raw.strip().lstrip("vV").split("+", 1)[0]
+    core, _, pre = text.partition("-")
+    major, minor, patch = (int(part) for part in core.split("."))
+    segments = [int(seg) if seg.isdigit() else seg for seg in pre.split(".")] if pre else []
+    return (major, minor, patch), segments
+
+
+def _compare_versions(left, right):
+    left_core, left_pre = _parse_version(left)
+    right_core, right_pre = _parse_version(right)
+    if left_core != right_core:
+        return -1 if left_core < right_core else 1
+    if not left_pre and not right_pre:
+        return 0
+    if not left_pre:
+        return 1
+    if not right_pre:
+        return -1
+    for l_seg, r_seg in zip(left_pre, right_pre):
+        if type(l_seg) is type(r_seg):
+            if l_seg != r_seg:
+                return -1 if l_seg < r_seg else 1
+        else:
+            return -1 if isinstance(l_seg, int) else 1
+    if len(left_pre) == len(right_pre):
+        return 0
+    return -1 if len(left_pre) < len(right_pre) else 1
+
+
+def includes_mobile(tag):
+    return _compare_versions(validate_tag(tag), MOBILE_RELEASE_MIN_VERSION) >= 0
+
+
 def expected_names(tag):
     version = validate_tag(tag)[1:]
     servers = [
@@ -48,13 +82,25 @@ def expected_names(tag):
         "agent2api-server-linux-arm64.tar.gz",
         "agent2api-server-windows-amd64.zip",
     ]
-    return [
+    names = [
         f"Agent2API_{version}_x64-setup.exe",
         f"Agent2API_{version}_universal.dmg",
         f"Agent2API_{version}_amd64.deb",
         f"Agent2API_{version}_amd64.AppImage",
         *[file for server in servers for file in (server, server + ".sha256")],
     ]
+    if includes_mobile(tag):
+        names.extend([
+            f"Agent2API-{version}.apk",
+            f"Agent2API-{version}.apk.sha256",
+            f"Agent2API-{version}.ipa",
+            f"Agent2API-{version}.ipa.sha256",
+        ])
+    return names
+
+
+def expected_file_count(tag):
+    return len(expected_names(tag))
 
 
 def file_sha256(path):

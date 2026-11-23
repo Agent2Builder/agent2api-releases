@@ -1,7 +1,7 @@
 name: publish-installers
 
 # 官网发布与源码仓库镜像独立收尾；只重跑失败的任务，不重新编译。
-# 十份公开文件 = 四份桌面安装包 + 三份服务端包及各自校验文件；手机包仍只留构建产物。
+# 3.5.0-beta.8 起为十四份公开文件 = 桌面端 4 + 服务端 6 + 手机端 4（APK / IPA 及各自校验文件）；更早版本保持十份。
 on:
   workflow_run:
     workflows: ["Release"]
@@ -68,13 +68,13 @@ jobs:
           RELEASE_PUBLISH_SECRET: ${{ secrets.RELEASE_PUBLISH_SECRET }}
         run: python3 .github/scripts/website-release.py check
 
-      - name: 取原始构建的电脑端与服务端产物
+      - name: 取原始构建的各平台产物
         if: ${{ env.ONLY != 'website' }}
         uses: actions/download-artifact@v8
         with:
           run-id: ${{ env.RUN_ID }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          pattern: '{windows-nsis,macos-universal,linux-desktop,linux-server-amd64,linux-server-arm64,windows-server-amd64}'
+          pattern: '{windows-nsis,macos-universal,linux-desktop,linux-server-amd64,linux-server-arm64,windows-server-amd64,android-apk,ios-ipa}'
           path: dist
 
       - name: 清点文件并确定版本
@@ -121,7 +121,7 @@ jobs:
           git -C source log -1 --format=%B > release-assets/notes.md
           test -s release-assets/notes.md
 
-      - name: 保存收尾共用的十份文件
+      - name: 保存收尾共用的发布文件
         if: ${{ env.ONLY != 'website' }}
         uses: actions/upload-artifact@v7
         with:
@@ -154,7 +154,7 @@ jobs:
       - name: 安装 R2 上传工具
         run: python3 -m pip install --disable-pip-version-check boto3==1.44.1
 
-      - name: 将十份原始文件上传到 R2
+      - name: 将原始文件上传到 R2
         env:
           R2_ENDPOINT: ${{ vars.R2_ENDPOINT }}
           R2_BUCKET_NAME: ${{ vars.R2_BUCKET_NAME }}

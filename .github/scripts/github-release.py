@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 
 from website_release_common import (
-    MAX_INSTALLER_BYTES, RELEASE_FILE_COUNT, expected_names, file_sha256, gh_api, redact,
+    MAX_INSTALLER_BYTES, expected_file_count, expected_names, file_sha256, gh_api, redact,
     release_path, repository, summary, validate_tag,
 )
 
@@ -65,13 +65,14 @@ def publish(args, mirror=False):
     notes = (args.directory / "notes.md").read_text(encoding="utf-8")
     if not notes.strip() or len(notes) > 60000:
         raise RuntimeError("源码 tag 的发布正文为空或超过限制")
+    expected_count = expected_file_count(tag)
     prerelease = "-" in tag.split("+", 1)[0]
     release = gh_api(release_path(repo, tag), allow_missing=True)
     if release and not release.get("draft"):
         if release.get("prerelease") is not prerelease or source_notes(release.get("body") or "") != source_notes(notes):
             raise RuntimeError(f"{repo} 已公开版本的通道或正文不一致，未改写原发布")
         assets = release.get("assets", [])
-        if len(assets) != RELEASE_FILE_COUNT:
+        if len(assets) != expected_count:
             raise RuntimeError(f"{repo} 已公开的版本附件不完整，未自动覆盖")
         for file in files:
             asset = next((asset for asset in assets if asset.get("name") == file["name"]), None)
@@ -94,7 +95,7 @@ def publish(args, mirror=False):
         if current.get("draft") is not True:
             raise RuntimeError("上传期间 GitHub 版本已被公开，停止继续修改")
         assets = current.get("assets", [])
-        if (len(assets) == RELEASE_FILE_COUNT
+        if (len(assets) == expected_count
             and all(any(asset.get("name") == file["name"] and matches(asset, file) for asset in assets) for file in files)):
             break
         if attempt == 4:
@@ -110,7 +111,7 @@ def publish(args, mirror=False):
     if (published.get("draft") is not False or published.get("prerelease") is not prerelease
         or source_notes(published.get("body") or "") != source_notes(notes)):
         raise RuntimeError("GitHub 公开版本的状态或正文与源码不一致")
-    summary(f"GitHub 版本已公开：{repo} / {tag}，十份文件完整性校验通过。")
+    summary(f"GitHub 版本已公开：{repo} / {tag}，{expected_count} 份文件完整性校验通过。")
 
 
 def main():
