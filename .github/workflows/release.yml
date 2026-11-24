@@ -9,8 +9,9 @@ name: Release
 # 本仓库是公开仓库，标准 GitHub-hosted runner（含 macOS）对公开仓库免费且
 # 不计分钟数 —— macOS runner 是私有仓库里最贵的一档，公开仓库没有这个问题。
 #
-# ── 六个 job 的分工（名字相近，别看混）────────────────────────
-#   macos           → macOS 桌面端 dmg           → artifact: macos-universal
+# ── 各平台 job 的分工（名字相近，别看混）────────────────────────
+#   macos-build     → macOS 双架构并行编译（arm64 / x64）→ 临时 artifact: macos-bin-{arm64,x64}
+#   macos           → 合并通用可执行文件并打包 dmg         → artifact: macos-universal
 #   windows         → Windows 桌面端 NSIS exe    → artifact: windows-nsis
 #   linux-desktop   → Linux 桌面端 deb+AppImage  → artifact: linux-desktop
 #   linux-server    → Linux **服务端**包（无 GUI）→ artifact: linux-server-{amd64,arm64}
@@ -117,17 +118,27 @@ env:
   REF: ${{ github.event.client_payload.ref || github.event.inputs.ref }}
 
 jobs:
-  # ── macOS ─────────────────────────────────────────────────
-  macos:
-    # 用 universal 目标同时产出 x86_64 与 aarch64 两个架构并合并，Intel 与 M
-    # 芯片都能原生运行 —— 代价是 Rust 部分要编两遍，缓存命中时约十几分钟。
-    #
+  # ── macOS（双架构并行编译 → 合并通用安装包）────────────────────
+  # 原先单 job 跑 `--target universal-apple-darwin` 会在一台机器上串行编两遍
+  # Rust（arm64 + x64，共 25~34 分钟）。改为拆成两台 macos-26 并行各自编译，
+  # 再由下面的 macos job 用 lipo 合并并通过 tauri bundle 打出同一个 universal.dmg，
+  # 产物名、包结构与用户下载体验完全不变，总耗时缩短近一半。
+  macos-build:
+    name: macos-build (${{ matrix.arch }})
     # 标签写死 macos-26 而不是 macos-latest：两者当前都指向 macOS 26 arm64，
     # 但 macos-latest 这个通配标签在 arm64 池子里排队极久 —— 实测连续三次等待
     # 约 15 分钟后被 cancelled，runner_name 始终为空（GitHub 注解只提示
     # 「arm64 runners may experience longer queue times」）。同一批构建里 iOS
     # job 用 macos-26 就分到了机器，因此这里跟它保持一致。
     runs-on: macos-26
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: arm64
+            target: aarch64-apple-darwin
+          - arch: x64
+            target: x86_64-apple-darwin
     steps:
       - uses: actions/checkout@v7
         with:
@@ -145,25 +156,81 @@ jobs:
       - name: 安装 Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          # universal 需要两个目标都装上（合并时两个架构各编一遍）
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
+          targets: ${{ matrix.target }}
 
-      # 缓存 Rust 依赖：冷编译约 10 分钟，命中后大幅缩短。
-      # key 里带上 Cargo.lock 的哈希，依赖变动时自动失效。
-      # target 路径按 .cargo/config.toml 的 target-dir 指向仓库根的 target/
+      # 每个架构各自独立缓存一份依赖，避免两个并行矩阵任务互相覆盖缓存且单份缓存体积减半
       - name: 缓存 Rust 依赖
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: desktop-tauri/src-tauri -> ../../target
+          key: ${{ matrix.target }}
 
       - name: 安装桌面端依赖
         run: npm --prefix desktop-tauri ci
 
       # 不走 tauri-action：它的默认脚本是 `npm run tauri build`，而本项目的
       # package.json 里那条脚本叫 `build`（见 desktop-tauri/package.json）。
-      # 直接用 CLI 更直白，也少一层 action 的版本耦合。
-      - name: 构建 macOS 安装包
-        run: npm --prefix desktop-tauri run build -- --target universal-apple-darwin
+      # 这里传 `--no-bundle` 只编译单架构可执行文件（同时保留 tauri.macos.conf.json
+      # 的 minimumSystemVersion 与 mainBinaryName 重命名），留给下一个 job 统一合并打包。
+      - name: 编译 macOS 可执行文件（${{ matrix.arch }}）
+        run: npm --prefix desktop-tauri run build -- --no-bundle --target ${{ matrix.target }}
+
+      - name: 上传单架构可执行文件
+        uses: actions/upload-artifact@v7
+        with:
+          name: macos-bin-${{ matrix.arch }}
+          path: target/${{ matrix.target }}/release/agent2api
+          if-no-files-found: error
+          retention-days: 1
+
+  macos:
+    needs: [macos-build]
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.REF }}
+
+      - name: 安装 Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: desktop-tauri/package-lock.json
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 下载 arm64 可执行文件
+        uses: actions/download-artifact@v8
+        with:
+          name: macos-bin-arm64
+          path: macos-bins/arm64
+
+      - name: 下载 x64 可执行文件
+        uses: actions/download-artifact@v8
+        with:
+          name: macos-bin-x64
+          path: macos-bins/x64
+
+      - name: 合并通用可执行文件（lipo）
+        run: |
+          set -euo pipefail
+          mkdir -p target/universal-apple-darwin/release
+          lipo -create \
+            -output target/universal-apple-darwin/release/agent2api \
+            macos-bins/arm64/agent2api \
+            macos-bins/x64/agent2api
+          chmod +x target/universal-apple-darwin/release/agent2api
+          lipo -info target/universal-apple-darwin/release/agent2api
+
+      - name: 安装桌面端依赖
+        run: npm --prefix desktop-tauri ci
+
+      - name: 打包 macOS 通用安装包
+        working-directory: desktop-tauri
+        run: ./node_modules/.bin/tauri bundle --target universal-apple-darwin --ci
 
       - name: 上传产物
         uses: actions/upload-artifact@v7
